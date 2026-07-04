@@ -50,7 +50,11 @@ def transcribe_chords(audio_path: str) -> List[Dict[str, Any]]:
     Uses HPSS filtering, Harmonic CQT extraction, and an expanded 72-chord template engine.
     """
     # Hàm helper giả định có sẵn trong hệ thống của bạn để lấy thời lượng
-    # duration = get_audio_duration(audio_path)
+    duration = 180.0
+    try:
+        duration = get_audio_duration(audio_path)
+    except Exception:
+        pass
     
     try:
         import librosa
@@ -170,7 +174,7 @@ def transcribe_chords(audio_path: str) -> List[Dict[str, Any]]:
     except Exception as e:
         logger.error(f"Advanced chord transcription failed: {e}")
         # Trả về mảng trống hoặc gọi hàm fallback tùy kiến trúc của bạn
-        return []
+        return get_mock_chords(duration)
 
 def write_minimal_midi(output_path: str):
     """
@@ -274,6 +278,28 @@ def clean_lyric_word(word: str) -> str:
 
     return f"{leading_punc}{core_cleaned}{trailing_punc}"
 
+def list_suppress_tokens(tokenizer):
+    # Sử dụng các token không phải lời nói mặc định của tokenizer (chặn ký tự điều khiển, nhạc nền, v.v...)
+    suppress_list = list(tokenizer.non_speech_tokens)
+    
+    # Chặn thêm các từ khóa quảng cáo/âm thanh nền phổ biến bằng tiếng Anh và tiếng Việt hay gây ảo giác
+    redundant_tokens = [
+        "[Music]", "[music]", "[Laughter]", "[laughter]", "[Applause]", "[applause]",
+        "[Background noise]", "[coughing]", "[sighing]", "[throat-clearing]",
+        "Hãy subscribe", "Ghiền Mì Gõ", "Ghiền Mì", "Mì Gõ", "subscribe cho kênh"
+    ]
+    
+    for tu in redundant_tokens:
+        try:
+            # Mã hóa chuỗi chữ thành danh sách ID token tương ứng
+            token_ids = tokenizer.encode(tu)
+            suppress_list.extend(token_ids)
+        except Exception:
+            pass
+            
+    # Loại bỏ các ID trùng lặp để tối ưu hóa mảng
+    return list(set(suppress_list))
+
 def transcribe_lyrics(audio_path: str) -> List[Dict[str, Any]]:
     """
     Transcribes Vietnamese lyrics from the isolated vocal track.
@@ -302,8 +328,8 @@ def transcribe_lyrics(audio_path: str) -> List[Dict[str, Any]]:
 
     try:
         import whisper
+        import whisper.tokenizer
         import torch
-        
         # Exclude MPS (GPU on macOS) for Whisper due to NotImplementedError with sparse COO tensors in PyTorch
         device = "cpu"
         if torch.cuda.is_available():
@@ -312,10 +338,15 @@ def transcribe_lyrics(audio_path: str) -> List[Dict[str, Any]]:
         logger.info(f"Loading Whisper 'large-v3' model on device: {device}...")
         model = whisper.load_model("large-v3", device=device)
         logger.info("Running Whisper transcription with word timestamps (beam_size=7, temperature=0.1)...")
-        
+        tokenizer = whisper.tokenizer.get_tokenizer(
+            model.is_multilingual, 
+            num_languages=model.num_languages
+        )
         # fp16 is only supported on CUDA devices; set to False on CPU to suppress warning
         fp16_mode = (device == "cuda")
         
+        suppress_tokens = list_suppress_tokens(tokenizer)
+
         universal_song_prompt = (
             "Clean music lyrics transcript. Properly punctuated, well-structured sentences, "
             "and segmented line by line like poetry. No system notes, no background noise descriptions, "
@@ -332,7 +363,8 @@ def transcribe_lyrics(audio_path: str) -> List[Dict[str, Any]]:
             condition_on_previous_text=False,
             compression_ratio_threshold=2.4,
             logprob_threshold=-1.0,
-            no_speech_threshold=0.4,
+            no_speech_threshold=0.5,
+            suppress_tokens=suppress_tokens,
             fp16=fp16_mode
         )
         
@@ -340,7 +372,7 @@ def transcribe_lyrics(audio_path: str) -> List[Dict[str, Any]]:
         for segment in result.get("segments", []):
             # Skip silent segments or those with high probability of no speech
             no_speech_prob = segment.get("no_speech_prob", 0.0)
-            if no_speech_prob > 0.45:
+            if no_speech_prob > 0.90:
                 logger.info(f"Skipping silent segment ({no_speech_prob:.2f}): '{segment.get('text')}'")
                 continue
                 
@@ -350,26 +382,48 @@ def transcribe_lyrics(audio_path: str) -> List[Dict[str, Any]]:
             
             words = []
             cleaned_words_list = []
-            for word_info in segment.get("words", []):
-                raw_word = word_info["word"].strip()
-                if not raw_word:
-                    continue
-                
-                cleaned_word = clean_lyric_word(raw_word)
-                cleaned_words_list.append(cleaned_word)
-                
-                words.append({
-                    "word": cleaned_word,
-                    "time": round(word_info["start"], 2),
-                    "duration": round(word_info["end"] - word_info["start"], 2)
-                })
+            
+            # Trích xuất timestamp cấp từ nếu Whisper cung cấp
+            raw_words_info = segment.get("words", [])
+            if raw_words_info:
+                for word_info in raw_words_info:
+                    raw_word = word_info["word"].strip()
+                    if not raw_word:
+                        continue
+                    
+                    cleaned_word = clean_lyric_word(raw_word)
+                    cleaned_words_list.append(cleaned_word)
+                    
+                    words.append({
+                        "word": cleaned_word,
+                        "time": round(word_info["start"], 2),
+                        "duration": round(word_info["end"] - word_info["start"], 2)
+                    })
+            
+            # Nếu không có thông tin từ, phân bổ đều theo số lượng từ của phân đoạn để tránh mất lyrics
+            if not words:
+                raw_words = segment_text.split()
+                if raw_words:
+                    seg_start = segment.get("start", 0.0)
+                    seg_end = segment.get("end", seg_start + 1.0)
+                    seg_dur = max(0.1, seg_end - seg_start)
+                    word_dur = seg_dur / len(raw_words)
+                    
+                    for idx, w in enumerate(raw_words):
+                        cleaned_w = clean_lyric_word(w)
+                        cleaned_words_list.append(cleaned_w)
+                        words.append({
+                            "word": cleaned_w,
+                            "time": round(seg_start + idx * word_dur, 2),
+                            "duration": round(word_dur, 2)
+                        })
             
             if not words:
                 continue
             
             lyrics_segments.append({
-                "time": round(segment["start"], 2),
-                "duration": round(segment["end"] - segment["start"], 2),
+                "time": round(segment.get("start", 0.0), 2),
+                "duration": round(segment.get("end", 0.0) - segment.get("start", 0.0), 2),
                 "text": " ".join(cleaned_words_list),
                 "words": words
             })
