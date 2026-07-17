@@ -290,7 +290,6 @@ def transcribe_lyrics(audio_path: str) -> List[Dict[str, Any]]:
     audio_for_whisper = audio_path
     whisper_audio_path = os.path.join(os.path.dirname(audio_path), "vocals_whisper_16k.wav")
     
-    temp_files_to_clean = []
     # Step 1: Preprocess vocals track (resample to 16kHz mono WAV for optimal Whisper/STT input)
     try:
         import subprocess
@@ -302,7 +301,6 @@ def transcribe_lyrics(audio_path: str) -> List[Dict[str, Any]]:
         ]
         subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
         audio_for_whisper = whisper_audio_path
-        temp_files_to_clean.append(audio_for_whisper)
     except Exception as e:
         logger.warning(f"Could not resample vocals track: {e}. Using raw vocals audio instead.")
 
@@ -326,18 +324,15 @@ def transcribe_lyrics(audio_path: str) -> List[Dict[str, Any]]:
         logger.info(f"Initializing Google SpeechClient with region: {location} (project: {project_id})...")
         
         if location == "global":
-            # Với vùng "global", KHÔNG cần truyền client_options. 
-            # Thư viện Google v2 sẽ tự động trỏ về global-speech.googleapis.com một cách chính xác nhất.
             client = SpeechClient()
         else:
-            # Với các vùng cụ thể (như us-central1), bắt buộc phải có api_endpoint vùng
             client = SpeechClient(
                 client_options=ClientOptions(
                     api_endpoint=f"{location}-speech.googleapis.com"
                 )
             )
 
-        # 2. Configure recognition settings using the 'chirp' model with word offsets
+        # 2. Configure recognition settings
         config = cloud_speech.RecognitionConfig(
             auto_decoding_config=cloud_speech.AutoDetectDecodingConfig(),
             language_codes=["vi-VN"],
@@ -347,54 +342,34 @@ def transcribe_lyrics(audio_path: str) -> List[Dict[str, Any]]:
             )
         )
 
-        # 3. Determine duration and split into chunks of 50 seconds to respect Google's 60-second limit for sync recognize
-        chunk_files = []
-        chunk_duration = 50.0
-        
-        if duration > 55.0:
-            num_chunks = int(duration // chunk_duration) + (1 if duration % chunk_duration > 0 else 0)
-            logger.info(f"Vocal track duration ({duration:.2f}s) exceeds 55s. Splitting into {num_chunks} chunks using ffmpeg.")
-            for i in range(num_chunks):
-                start_time = i * chunk_duration
-                chunk_path = os.path.join(os.path.dirname(audio_for_whisper), f"vocals_chunk_{i:03d}.wav")
-                
-                cmd = [
-                    "ffmpeg", "-y",
-                    "-ss", str(start_time),
-                    "-t", str(chunk_duration),
-                    "-i", audio_for_whisper,
-                    chunk_path
-                ]
-                subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
-                chunk_files.append((chunk_path, start_time))
-                temp_files_to_clean.append(chunk_path)
-        else:
-            chunk_files.append((audio_for_whisper, 0.0))
+        # 3. Read raw audio data
+        with open(audio_for_whisper, "rb") as f:
+            audio_content = f.read()
 
-        # Helper to convert Duration to seconds
-        def duration_to_seconds(dur) -> float:
-            if dur is None:
-                return 0.0
-            sec = getattr(dur, "seconds", 0)
-            nanos = getattr(dur, "nanos", 0)
-            return float(sec) + float(nanos) / 1e9
+        # Build inline BatchRecognizeRequest to support files up to 15 mins long without GCS
+        file_metadata = cloud_speech.BatchRecognizeFileMetadata(content=audio_content)
+        recognizer_path = f"projects/{project_id}/locations/{location}/recognizers/_"
+        
+        request = cloud_speech.BatchRecognizeRequest(
+            recognizer=recognizer_path,
+            config=config,
+            files=[file_metadata]
+        )
+
+        logger.info("Sending asynchronous batch transcription request to Google Speech-to-Text V2 (Chirp)...")
+        operation = client.batch_recognize(request=request)
+        response = operation.result()
 
         lyrics_segments = []
 
-        # 4. Transcribe each chunk and combine results
-        for chunk_path, offset in chunk_files:
-            logger.info(f"Sending transcription request to Google Speech-to-Text V2 for chunk at {offset:.2f}s...")
-            with open(chunk_path, "rb") as f:
-                audio_content = f.read()
+        # Retrieve the single file result using the recognizer path key (or default fallback to first result)
+        file_results = response.results.get(recognizer_path)
+        if file_results is None and response.results:
+            file_results = list(response.results.values())[0]
 
-            request = cloud_speech.RecognizeRequest(
-                recognizer=f"projects/{project_id}/locations/{location}/recognizers/_",
-                config=config,
-                content=audio_content,
-            )
-            response = client.recognize(request=request)
-
-            for result in response.results:
+        # Loop through the transcript results if present
+        if file_results and file_results.transcript and file_results.transcript.results:
+            for result in file_results.transcript.results:
                 if not result.alternatives:
                     continue
                 
@@ -415,8 +390,8 @@ def transcribe_lyrics(audio_path: str) -> List[Dict[str, Any]]:
                     cleaned_w = clean_lyric_word(w_text)
                     cleaned_words_list.append(cleaned_w)
 
-                    start_time = duration_to_seconds(word_obj.start_offset) + offset
-                    end_time = duration_to_seconds(word_obj.end_offset) + offset
+                    start_time = word_obj.start_offset.total_seconds() if word_obj.start_offset is not None else 0.0
+                    end_time = word_obj.end_offset.total_seconds() if word_obj.end_offset is not None else start_time
 
                     words.append({
                         "word": cleaned_w,
@@ -427,8 +402,9 @@ def transcribe_lyrics(audio_path: str) -> List[Dict[str, Any]]:
                 if not words:
                     # Fallback if no word offsets were returned
                     raw_words = transcript_text.split()
-                    seg_start = offset
-                    word_dur = chunk_duration / len(raw_words) if raw_words else 1.0
+                    seg_start = 0.0
+                    seg_end = duration
+                    word_dur = duration / len(raw_words) if raw_words else 1.0
                     
                     for idx, w in enumerate(raw_words):
                         cleaned_w = clean_lyric_word(w)
@@ -438,7 +414,6 @@ def transcribe_lyrics(audio_path: str) -> List[Dict[str, Any]]:
                             "time": round(seg_start + idx * word_dur, 2),
                             "duration": round(word_dur, 2)
                         })
-                    seg_end = seg_start + chunk_duration
                 else:
                     seg_start = words[0]["time"]
                     seg_end = words[-1]["time"] + words[-1]["duration"]
@@ -450,25 +425,23 @@ def transcribe_lyrics(audio_path: str) -> List[Dict[str, Any]]:
                     "words": words
                 })
 
-        # Clean up all temporary files
-        for temp_file in temp_files_to_clean:
-            if os.path.exists(temp_file):
-                try:
-                    os.remove(temp_file)
-                except Exception as cleanup_err:
-                    logger.warning(f"Could not clean up temporary file {temp_file}: {cleanup_err}")
+        # Clean up the resampled audio file if it was created
+        if audio_for_whisper != audio_path and os.path.exists(audio_for_whisper):
+            try:
+                os.remove(audio_for_whisper)
+            except Exception as cleanup_err:
+                logger.warning(f"Could not clean up resampled audio file {audio_for_whisper}: {cleanup_err}")
 
         logger.info(f"Google Cloud Speech-to-Text V2 transcribed {len(lyrics_segments)} segments.")
         return lyrics_segments
 
     except Exception as e:
-        # Clean up all temporary files
-        for temp_file in temp_files_to_clean:
-            if os.path.exists(temp_file):
-                try:
-                    os.remove(temp_file)
-                except Exception as cleanup_err:
-                    logger.warning(f"Could not clean up temporary file {temp_file}: {cleanup_err}")
+        # Clean up the resampled audio file if it was created
+        if audio_for_whisper != audio_path and os.path.exists(audio_for_whisper):
+            try:
+                os.remove(audio_for_whisper)
+            except Exception as cleanup_err:
+                logger.warning(f"Could not clean up resampled audio file {audio_for_whisper}: {cleanup_err}")
 
         logger.warning(f"Google Speech-to-Text V2 transcription failed or skipped: {e}. Returning 'No lyrics detected'.")
         
