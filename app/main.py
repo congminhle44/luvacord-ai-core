@@ -85,6 +85,24 @@ from app.audio.pipeline import JOBS_BASE_DIR
 from app.audio.cleanup import cleanup_path
 import json
 import asyncio
+import queue
+import threading
+
+def run_generator_in_thread(gen_func, *args, **kwargs):
+    q = queue.Queue()
+    
+    def worker():
+        try:
+            for item in gen_func(*args, **kwargs):
+                q.put((item, None))
+        except Exception as e:
+            q.put((None, e))
+        finally:
+            q.put((None, None))
+            
+    t = threading.Thread(target=worker, daemon=True)
+    t.start()
+    return q
 
 async def lyrics_stream_generator(job_id: str, vocal_filename: str):
     job_dir = os.path.join(JOBS_BASE_DIR, job_id)
@@ -98,14 +116,19 @@ async def lyrics_stream_generator(job_id: str, vocal_filename: str):
 
         logger.info(f"Starting asynchronous lyrics streaming for job: {job_id}")
         
-        # Run the CPU-heavy Whisper ASR in a thread pool executor to avoid blocking uvicorn
-        loop = asyncio.get_running_loop()
-        segments = await loop.run_in_executor(None, transcribe_lyrics, audio_path)
+        # Run the CPU/network-heavy transcription generator in a background thread
+        q = run_generator_in_thread(transcribe_lyrics, audio_path)
         
-        # Stream the transcribed segments one-by-one with a smooth delay (simulating real-time typing)
-        for segment in segments:
-            yield f"data: {json.dumps(segment, ensure_ascii=False)}\n\n"
-            await asyncio.sleep(0.4)  # 400ms delay between lines for typing effect
+        loop = asyncio.get_running_loop()
+        while True:
+            # We run q.get in the executor to avoid blocking the asyncio event loop
+            item, err = await loop.run_in_executor(None, q.get)
+            if err is not None:
+                raise err
+            if item is None:
+                break
+            
+            yield f"data: {json.dumps(item, ensure_ascii=False)}\n\n"
             
         yield "data: [DONE]\n\n"
         

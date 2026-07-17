@@ -1,6 +1,7 @@
 import os
+import subprocess
 import logging
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Generator
 
 logger = logging.getLogger("audio_pipeline.transcription")
 
@@ -9,7 +10,6 @@ def get_audio_duration(audio_path: str) -> float:
     Attempts to retrieve the audio duration using ffprobe if available.
     Otherwise, returns a default duration based on typical track sizes.
     """
-    import subprocess
     try:
         cmd = [
             "ffprobe", "-v", "error",
@@ -278,7 +278,7 @@ def clean_lyric_word(word: str) -> str:
 
     return f"{leading_punc}{core_cleaned}{trailing_punc}"
 
-def transcribe_lyrics(audio_path: str) -> List[Dict[str, Any]]:
+def transcribe_lyrics(audio_path: str) -> Generator[Dict[str, Any], None, None]:
     """
     Transcribes Vietnamese lyrics from the isolated vocal track.
     Attempts to use the Google Cloud Speech-to-Text V2 API (Chirp model),
@@ -292,7 +292,6 @@ def transcribe_lyrics(audio_path: str) -> List[Dict[str, Any]]:
     
     # Step 1: Preprocess vocals track (resample to 16kHz mono WAV for optimal Whisper/STT input)
     try:
-        import subprocess
         logger.info(f"Downsampling vocals track to 16kHz mono WAV for Speech-to-Text: {whisper_audio_path}")
         cmd = [
             "ffmpeg", "-y", "-i", audio_path,
@@ -303,6 +302,10 @@ def transcribe_lyrics(audio_path: str) -> List[Dict[str, Any]]:
         audio_for_whisper = whisper_audio_path
     except Exception as e:
         logger.warning(f"Could not resample vocals track: {e}. Using raw vocals audio instead.")
+
+    temp_files_to_clean = []
+    if audio_for_whisper != audio_path:
+        temp_files_to_clean.append(audio_for_whisper)
 
     try:
         # Avoid calling Google Speech API if the input is a small mock audio file during testing
@@ -342,34 +345,57 @@ def transcribe_lyrics(audio_path: str) -> List[Dict[str, Any]]:
             )
         )
 
-        # 3. Read raw audio data
-        with open(audio_for_whisper, "rb") as f:
-            audio_content = f.read()
-
-        # Build inline BatchRecognizeRequest to support files up to 15 mins long without GCS
-        file_metadata = cloud_speech.BatchRecognizeFileMetadata(content=audio_content)
-        recognizer_path = f"projects/{project_id}/locations/{location}/recognizers/_"
+        # 3. Determine duration and split into chunks of 50 seconds to respect Google's 60-second limit for sync recognize
+        chunk_files = []
+        chunk_duration = 50.0
         
-        request = cloud_speech.BatchRecognizeRequest(
-            recognizer=recognizer_path,
-            config=config,
-            files=[file_metadata]
-        )
+        if duration > 55.0:
+            num_chunks = int(duration // chunk_duration) + (1 if duration % chunk_duration > 0 else 0)
+            logger.info(f"Vocal track duration ({duration:.2f}s) exceeds 55s. Splitting into {num_chunks} chunks using ffmpeg.")
+            for i in range(num_chunks):
+                start_time = i * chunk_duration
+                chunk_path = os.path.join(os.path.dirname(audio_for_whisper), f"vocals_chunk_{i:03d}.wav")
+                
+                cmd = [
+                    "ffmpeg", "-y",
+                    "-ss", str(start_time),
+                    "-t", str(chunk_duration),
+                    "-i", audio_for_whisper,
+                    chunk_path
+                ]
+                subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+                chunk_files.append((chunk_path, start_time))
+                temp_files_to_clean.append(chunk_path)
+        else:
+            chunk_files.append((audio_for_whisper, 0.0))
 
-        logger.info("Sending asynchronous batch transcription request to Google Speech-to-Text V2 (Chirp)...")
-        operation = client.batch_recognize(request=request)
-        response = operation.result()
+        # Helper to convert Duration to seconds
+        def duration_to_seconds(dur) -> float:
+            if dur is None:
+                return 0.0
+            if hasattr(dur, "total_seconds"):
+                return dur.total_seconds()
+            sec = getattr(dur, "seconds", 0)
+            nanos = getattr(dur, "nanos", 0)
+            return float(sec) + float(nanos) / 1e9
 
-        lyrics_segments = []
+        # 4. Transcribe each chunk and combine results
+        for chunk_path, offset in chunk_files:
+            logger.info(f"Sending transcription request to Google Speech-to-Text V2 for chunk at {offset:.2f}s...")
+            with open(chunk_path, "rb") as f:
+                audio_content = f.read()
 
-        # Retrieve the single file result using the recognizer path key (or default fallback to first result)
-        file_results = response.results.get(recognizer_path)
-        if file_results is None and response.results:
-            file_results = list(response.results.values())[0]
+            request = cloud_speech.RecognizeRequest(
+                recognizer=f"projects/{project_id}/locations/{location}/recognizers/_",
+                config=config,
+                content=audio_content,
+            )
+            response = client.recognize(request=request)
 
-        # Loop through the transcript results if present
-        if file_results and file_results.transcript and file_results.transcript.results:
-            for result in file_results.transcript.results:
+            if response is None or getattr(response, "results", None) is None:
+                continue
+
+            for result in response.results:
                 if not result.alternatives:
                     continue
                 
@@ -380,7 +406,6 @@ def transcribe_lyrics(audio_path: str) -> List[Dict[str, Any]]:
 
                 words_info = alternative.words
                 words = []
-                cleaned_words_list = []
 
                 for word_obj in words_info:
                     w_text = word_obj.word.strip()
@@ -388,10 +413,8 @@ def transcribe_lyrics(audio_path: str) -> List[Dict[str, Any]]:
                         continue
 
                     cleaned_w = clean_lyric_word(w_text)
-                    cleaned_words_list.append(cleaned_w)
-
-                    start_time = word_obj.start_offset.total_seconds() if word_obj.start_offset is not None else 0.0
-                    end_time = word_obj.end_offset.total_seconds() if word_obj.end_offset is not None else start_time
+                    start_time = duration_to_seconds(word_obj.start_offset) + offset
+                    end_time = duration_to_seconds(word_obj.end_offset) + offset
 
                     words.append({
                         "word": cleaned_w,
@@ -402,50 +425,60 @@ def transcribe_lyrics(audio_path: str) -> List[Dict[str, Any]]:
                 if not words:
                     # Fallback if no word offsets were returned
                     raw_words = transcript_text.split()
-                    seg_start = 0.0
-                    seg_end = duration
-                    word_dur = duration / len(raw_words) if raw_words else 1.0
-                    
-                    for idx, w in enumerate(raw_words):
-                        cleaned_w = clean_lyric_word(w)
-                        cleaned_words_list.append(cleaned_w)
-                        words.append({
-                            "word": cleaned_w,
-                            "time": round(seg_start + idx * word_dur, 2),
-                            "duration": round(word_dur, 2)
-                        })
+                    if raw_words:
+                        word_dur = chunk_duration / len(raw_words)
+                        for i in range(0, len(raw_words), 8):
+                            group_raw = raw_words[i:i+8]
+                            group_words = []
+                            for idx, w in enumerate(group_raw):
+                                word_index = i + idx
+                                cleaned_w = clean_lyric_word(w)
+                                start_time = offset + word_index * word_dur
+                                group_words.append({
+                                    "word": cleaned_w,
+                                    "time": round(start_time, 2),
+                                    "duration": round(word_dur, 2)
+                                })
+                            seg_start = group_words[0]["time"]
+                            seg_end = group_words[-1]["time"] + group_words[-1]["duration"]
+                            yield {
+                                "time": round(seg_start, 2),
+                                "duration": round(max(0.1, seg_end - seg_start), 2),
+                                "text": " ".join([item["word"] for item in group_words]),
+                                "words": group_words
+                            }
                 else:
-                    seg_start = words[0]["time"]
-                    seg_end = words[-1]["time"] + words[-1]["duration"]
+                    # Split words list based on pause threshold (1.0 second)
+                    pause_threshold = 1.0
+                    grouped_segments = []
+                    current_group = []
+                    for w in words:
+                        if not current_group:
+                            current_group.append(w)
+                        else:
+                            prev_w = current_group[-1]
+                            gap = w["time"] - (prev_w["time"] + prev_w["duration"])
+                            if gap >= pause_threshold:
+                                grouped_segments.append(current_group)
+                                current_group = [w]
+                            else:
+                                current_group.append(w)
+                    if current_group:
+                        grouped_segments.append(current_group)
 
-                lyrics_segments.append({
-                    "time": round(seg_start, 2),
-                    "duration": round(max(0.1, seg_end - seg_start), 2),
-                    "text": " ".join(cleaned_words_list),
-                    "words": words
-                })
-
-        # Clean up the resampled audio file if it was created
-        if audio_for_whisper != audio_path and os.path.exists(audio_for_whisper):
-            try:
-                os.remove(audio_for_whisper)
-            except Exception as cleanup_err:
-                logger.warning(f"Could not clean up resampled audio file {audio_for_whisper}: {cleanup_err}")
-
-        logger.info(f"Google Cloud Speech-to-Text V2 transcribed {len(lyrics_segments)} segments.")
-        return lyrics_segments
+                    for group in grouped_segments:
+                        seg_start = group[0]["time"]
+                        seg_end = group[-1]["time"] + group[-1]["duration"]
+                        yield {
+                            "time": round(seg_start, 2),
+                            "duration": round(max(0.1, seg_end - seg_start), 2),
+                            "text": " ".join([item["word"] for item in group]),
+                            "words": group
+                        }
 
     except Exception as e:
-        # Clean up the resampled audio file if it was created
-        if audio_for_whisper != audio_path and os.path.exists(audio_for_whisper):
-            try:
-                os.remove(audio_for_whisper)
-            except Exception as cleanup_err:
-                logger.warning(f"Could not clean up resampled audio file {audio_for_whisper}: {cleanup_err}")
-
         logger.warning(f"Google Speech-to-Text V2 transcription failed or skipped: {e}. Returning 'No lyrics detected'.")
-        
-        return [{
+        yield {
             "time": 0.0,
             "duration": round(duration, 2),
             "text": "No lyrics detected",
@@ -454,4 +487,12 @@ def transcribe_lyrics(audio_path: str) -> List[Dict[str, Any]]:
                 "time": 0.0,
                 "duration": round(duration, 2)
             }]
-        }]
+        }
+    finally:
+        # Clean up all temporary files
+        for temp_file in temp_files_to_clean:
+            if os.path.exists(temp_file):
+                try:
+                    os.remove(temp_file)
+                except Exception as cleanup_err:
+                    logger.warning(f"Could not clean up temporary file {temp_file}: {cleanup_err}")
